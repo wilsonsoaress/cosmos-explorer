@@ -4,9 +4,6 @@ Protótipo funcional em Next.js para procurar uma **imagem do dia (APOD)** por d
 quando a busca é por **palavra-chave**, pesquisar no acervo da **NASA Image Library**.
 A chave da API nunca chega ao navegador: tudo passa por rotas próprias com cache.
 
-O plano completo (requisitos, restrições da API e decisões de arquitetura) está em
-[`../PLANO.md`](../PLANO.md).
-
 ## Rodar localmente
 
 Requisitos: Node 22+ (testado em v22.23.2) e npm.
