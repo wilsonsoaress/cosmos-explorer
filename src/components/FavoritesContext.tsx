@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useState, type ReactNode } from "react";
 import {
   type FavoriteItem,
   readFavorites,
@@ -21,14 +21,9 @@ type FavoritesContextValue = {
 const FavoritesContext = createContext<FavoritesContextValue | null>(null);
 
 export function FavoritesProvider({ children }: { children: ReactNode }) {
-  // Começa vazio e hidrata no useEffect — localStorage não existe no server.
-  const [items, setItems] = useState<FavoriteItem[]>([]);
-  const [hydrated, setHydrated] = useState(false);
-
-  useEffect(() => {
-    setItems(readFavorites());
-    setHydrated(true);
-  }, []);
+  const [items, setItems] = useState<FavoriteItem[]>(() =>
+    typeof window !== "undefined" ? readFavorites() : [],
+  );
 
   const persist = useCallback((next: FavoriteItem[]) => {
     setItems(next);
@@ -65,7 +60,7 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
 
   return (
     <FavoritesContext.Provider
-      value={{ items: hydrated ? items : [], isFavorite, toggle, remove, clear, count: items.length }}
+      value={{ items, isFavorite, toggle, remove, clear, count: items.length }}
     >
       {children}
     </FavoritesContext.Provider>
