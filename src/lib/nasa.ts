@@ -13,11 +13,27 @@ import { APOD_FIRST_DATE, isIsoDate, shiftDays, todayIso } from "@/lib/dates";
  *  - Limite de datas do APOD validado pelo servidor: 16/06/1995 até hoje.
  *  - images-api.nasa.gov responde CORS `*`, total_hits e links prev/next em http://.
  *
+ * ATUALIZAÇÃO (02/11/2026): a NASA migrou o APOD para o WordPress de
+ * science.nasa.gov e, na transição, `api.nasa.gov/planetary/apod` ficou quebrado —
+ * devolve `title: "NASA Science"` e uma URL de logo genérica para qualquer data,
+ * com ou sem chave própria. Isso não tinha nada a ver com NASA_API_KEY.
+ * Trocamos para a API nova (ver PDF oficial "APOD Feed And API User Guide"):
+ *  - Base: https://science.nasa.gov/wp-json/wp/v2/apod-basic — SEM chave.
+ *  - Um dia: `/apod-basic/{YYMMDD}` (código de data legado, ex. 261102). Devolve
+ *    objeto único; 404 com `{code:"apod_basic_not_found"}` se não existir.
+ *  - Intervalo: `?date_from={YYMMDD}&date_to={YYMMDD}&per_page=25`. Devolve array,
+ *    mais recente primeiro. `per_page` tem teto de 25 (documentado).
+ *  - Para imagem: a URL de exibição é `hdurl` (`url` virou o permalink do artigo).
+ *  - Para vídeo: não há campo de URL de mídia direto — o `<video><source src=...>`
+ *    ou `<iframe src=...>` (YouTube) vêm dentro de `basic_html`; `hdurl` é só o
+ *    pôster/thumbnail. `url` (permalink) vira o link "assistir na fonte".
+ *  - `explanation`/`credit` vêm como HTML (links, `<strong>`, `&nbsp;` etc.).
+ *
  * Por isso este módulo tem cache próprio, persistente em disco: reiniciar o dev
  * server não pode queimar a cota de novo.
  */
 
-const APOD_URL = "https://api.nasa.gov/planetary/apod";
+const APOD_BASE = "https://science.nasa.gov/wp-json/wp/v2/apod-basic";
 const LIBRARY_URL = "https://images-api.nasa.gov/search";
 
 export type ApodEntry = {
@@ -119,15 +135,6 @@ async function cacheWrite(key: string, value: unknown, ttlSeconds: number) {
   }
 }
 
-/* ------------------------------------------------------------------- chaves */
-
-function resolveApiKey(): { key: string; isDemo: boolean } {
-  const configured = process.env.NASA_API_KEY?.trim();
-  if (configured && configured !== "DEMO_KEY") return { key: configured, isDemo: false };
-  // DEMO_KEY permite ao protótipo rodar sem cadastro, a 10 req/h por IP.
-  return { key: configured || "DEMO_KEY", isDemo: true };
-}
-
 /* ------------------------------------------------------------- helpers de fetch */
 
 async function fetchJson(url: string, label: string): Promise<unknown> {
@@ -147,12 +154,20 @@ async function fetchJson(url: string, label: string): Promise<unknown> {
   }
 
   if (!res.ok) {
-    const err = (body as { error?: { code?: string; message?: string }; msg?: string }) ?? {};
-    const message = err.error?.message ?? err.msg ?? `HTTP ${res.status} de ${label}.`;
+    // Dois formatos de erro convivem: o antigo `{error:{code,message}}` / `{msg}`
+    // da api.nasa.gov, e o novo REST do WordPress `{code,message,data:{status}}`.
+    const err =
+      (body as {
+        error?: { code?: string; message?: string };
+        msg?: string;
+        code?: string;
+        message?: string;
+      }) ?? {};
+    const message = err.error?.message ?? err.message ?? err.msg ?? `HTTP ${res.status} de ${label}.`;
     const code =
       res.status === 429
         ? "RATE_LIMIT"
-        : (err.error?.code ?? (res.status === 400 ? "BAD_REQUEST" : "UPSTREAM_ERROR"));
+        : (err.error?.code ?? err.code ?? (res.status === 400 ? "BAD_REQUEST" : "UPSTREAM_ERROR"));
     const retryAfter = Number(res.headers.get("retry-after")) || undefined;
     throw new NasaError(message, res.status === 429 ? 429 : 502, code, retryAfter);
   }
@@ -169,19 +184,41 @@ function splitCopyright(raw: unknown): string[] {
     .filter(Boolean);
 }
 
-type RawApod = {
-  date?: string;
-  title?: string;
-  explanation?: string;
-  media_type?: string;
-  url?: string;
-  hdurl?: string;
-  preview_url?: string;
-  thumbnail_url?: string;
-  thumb_url?: string;
-  thumbnail?: string;
-  copyright?: string;
-};
+/** Decodifica entidades HTML comuns (numéricas e nomeadas) sem precisar de um DOM. */
+function decodeEntities(input: string): string {
+  return input
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec: string) => String.fromCodePoint(parseInt(dec, 10)))
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;|&apos;/g, "'");
+}
+
+/** A API nova devolve `explanation`/`credit` como HTML; o app exibe texto puro. */
+function stripHtml(html?: string): string {
+  if (!html) return "";
+  const withoutTags = html.replace(/<[^>]*>/g, " ");
+  return decodeEntities(withoutTags).replace(/\s+/g, " ").trim();
+}
+
+/** Limpa o prefixo padrão ("Image Credit & Copyright:") e separa autores. */
+function cleanCredit(raw?: string): string[] {
+  const text = stripHtml(raw)
+    .replace(/^image\s*credit\s*(?:&|and)?\s*copyright\s*:?\s*/i, "")
+    .replace(/^image\s*credit\s*:?\s*/i, "")
+    .replace(/^copyright\s*:?\s*/i, "")
+    .trim();
+  return splitCopyright(text);
+}
+
+/** `YYYY-MM-DD` -> código de data legado do APOD (`YYMMDD`), usado nas novas rotas. */
+function toLegacyApodCode(iso: string): string {
+  const [y, m, d] = iso.split("-");
+  return `${y.slice(-2)}${m}${d}`;
+}
 
 const YOUTUBE_ID = /(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/|live\/)|youtu\.be\/)([\w-]{6,})/i;
 const VIMEO_ID = /vimeo\.com\/(?:video\/)?(\d+)/i;
@@ -198,30 +235,79 @@ export function videoPlayers(url: string): { embedUrl?: string; videoSrc?: strin
   return {};
 }
 
-/** Campo opcional: a NASA devolve `""` em vez de omitir (ex.: `thumbnail_url` em vídeo). */
+/** Campo opcional: a NASA devolve `""` em vez de omitir. */
 export function opt(value?: string): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
 }
 
+/**
+ * APOD em vídeo não traz URL de mídia num campo próprio: o player (`<iframe>` do
+ * YouTube ou `<video><source>` auto-hospedado) vem embutido no `basic_html`.
+ */
+function extractVideoFromHtml(html?: string): { embedUrl?: string; videoSrc?: string } {
+  if (!html) return {};
+  const iframeMatch = /<iframe[^>]*\ssrc="([^"]+)"/i.exec(html);
+  if (iframeMatch) {
+    const raw = iframeMatch[1];
+    const normalized = raw.startsWith("//") ? `https:${raw}` : raw;
+    const players = videoPlayers(normalized);
+    return { embedUrl: players.embedUrl ?? normalized };
+  }
+  const sourceMatch = /<source[^>]*\ssrc="([^"]+\.(?:mp4|webm|mov|m4v))"/i.exec(html);
+  if (sourceMatch) return { videoSrc: sourceMatch[1] };
+  return {};
+}
+
+type RawApod = {
+  date?: string;
+  title?: string;
+  explanation?: string;
+  media_type?: string;
+  /** Permalink do artigo em science.nasa.gov — NÃO é a imagem (ver `hdurl`). */
+  url?: string;
+  /** Imagem cheia (quando `media_type` é `image`) ou pôster (quando é `video`). */
+  hdurl?: string;
+  /** HTML completo da página legado; único lugar com o player de vídeo. */
+  basic_html?: string;
+  credit?: string;
+  copyright?: string;
+};
+
 function toApodEntry(raw: RawApod): ApodEntry {
   const media = raw.media_type === "video" ? "video" : raw.media_type === "image" ? "image" : "other";
-  const url = raw.url ?? "";
-  const players = media === "video" ? videoPlayers(url) : {};
-  const preview = opt(raw.preview_url);
-  const directFile = players.videoSrc ?? (preview && VIDEO_FILE.test(preview) ? preview : undefined);
+  const explanation = stripHtml(raw.explanation).replace(/^explanation:\s*/i, "").trim();
+  const copyright = cleanCredit(raw.credit ?? raw.copyright);
+  const poster = opt(raw.hdurl);
+  const date = raw.date ?? "";
+  const title = raw.title?.trim() || "Sem título";
+
+  if (media === "video") {
+    const players = extractVideoFromHtml(raw.basic_html);
+    return {
+      date,
+      title,
+      explanation,
+      mediaType: media,
+      // Sem foto única para vídeo: `url` vira o permalink, usado como "assistir na fonte".
+      url: raw.url ?? "",
+      hdUrl: poster,
+      thumbnailUrl: poster,
+      embedUrl: players.embedUrl,
+      videoSrc: players.videoSrc,
+      copyright,
+    };
+  }
+
   return {
-    date: raw.date ?? "",
-    title: raw.title?.trim() || "Sem título",
-    explanation: raw.explanation?.trim() ?? "",
+    date,
+    title,
+    explanation,
     mediaType: media,
-    url,
-    hdUrl: opt(raw.hdurl),
-    // `thumbs=true` só traz thumbnail_url em vídeos; em imagens pode vir ausente ou vazio.
-    thumbnailUrl: opt(raw.thumbnail_url) ?? opt(raw.thumb_url) ?? opt(raw.thumbnail),
-    embedUrl: players.embedUrl,
-    videoSrc: directFile,
-    copyright: splitCopyright(raw.copyright),
+    url: poster ?? raw.url ?? "",
+    hdUrl: poster,
+    thumbnailUrl: poster,
+    copyright,
   };
 }
 
@@ -229,42 +315,44 @@ function toApodEntry(raw: RawApod): ApodEntry {
 
 /** Um dia específico. Aceita `YYYY-MM-DD`; datas fora do intervalo da NASA viram BAD_REQUEST. */
 export async function getApodByDate(date: string): Promise<{ entry: ApodEntry; meta: UpstreamMeta }> {
-  const { key, isDemo } = resolveApiKey();
   const ttl = date === todayIso() ? 600 : 86_400;
   const ck = cacheKey({ apod: date });
 
   const cached = await cacheRead(ck);
   if (cached) {
-    return { entry: toApodEntry(cached.value as RawApod), meta: { cache: "hit", usingDemoKey: isDemo, keyConfigured: !isDemo } };
+    return { entry: toApodEntry(cached.value as RawApod), meta: { cache: "hit", usingDemoKey: false, keyConfigured: true } };
   }
 
-  const url = `${APOD_URL}?api_key=${encodeURIComponent(key)}&date=${encodeURIComponent(date)}&hd=true&thumbs=true`;
+  const url = `${APOD_BASE}/${toLegacyApodCode(date)}`;
   const body = await fetchJson(url, "APOD");
   const entry = toApodEntry(body as RawApod);
   await cacheWrite(ck, body, ttl);
-  return { entry, meta: { cache: "miss", usingDemoKey: isDemo, keyConfigured: !isDemo } };
+  return { entry, meta: { cache: "miss", usingDemoKey: false, keyConfigured: true } };
 }
 
-/** Intervalo inclusivo, sem `count` (combinar os dois dá 400 na API real). */
+/** Intervalo inclusivo. `per_page` tem teto documentado de 25 resultados. */
 export async function getApodRange(
   start: string,
   end: string,
 ): Promise<{ entries: ApodEntry[]; meta: UpstreamMeta }> {
-  const { key, isDemo } = resolveApiKey();
   const ck = cacheKey({ apodRange: `${start}_${end}` });
 
   const cached = await cacheRead(ck);
   if (cached) {
     const entries = (cached.value as RawApod[]).map(toApodEntry);
-    return { entries, meta: { cache: "hit", usingDemoKey: isDemo, keyConfigured: !isDemo } };
+    return { entries, meta: { cache: "hit", usingDemoKey: false, keyConfigured: true } };
   }
 
-  const url = `${APOD_URL}?api_key=${encodeURIComponent(key)}&start_date=${start}&end_date=${end}&hd=true&thumbs=true`;
-  const body = await fetchJson(url, "APOD");
+  const params = new URLSearchParams({
+    date_from: toLegacyApodCode(start),
+    date_to: toLegacyApodCode(end),
+    per_page: "25",
+  });
+  const body = await fetchJson(`${APOD_BASE}?${params.toString()}`, "APOD");
   const rawList = Array.isArray(body) ? body : [body as RawApod];
   const entries = rawList.map(toApodEntry).sort((a, b) => a.date.localeCompare(b.date));
   await cacheWrite(ck, rawList, end === todayIso() ? 600 : 86_400);
-  return { entries, meta: { cache: "miss", usingDemoKey: isDemo, keyConfigured: !isDemo } };
+  return { entries, meta: { cache: "miss", usingDemoKey: false, keyConfigured: true } };
 }
 
 /* ------------------------------------------------------------ normalização Library */
