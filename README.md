@@ -2,7 +2,7 @@
 
 Protótipo funcional em Next.js para procurar uma **imagem do dia (APOD)** por data e,
 quando a busca é por **palavra-chave**, pesquisar no acervo da **NASA Image Library**.
-A chave da API nunca chega ao navegador: tudo passa por rotas próprias com cache.
+Nenhuma das duas APIs upstream exige chave hoje: tudo passa por rotas próprias com cache.
 
 ## Rodar localmente
 
@@ -10,19 +10,13 @@ Requisitos: Node 22+ (testado em v22.23.2) e npm.
 
 ```bash
 npm install
-cp .env.example .env.local   # cole sua chave em NASA_API_KEY=
 npm run dev
 ```
 
-Abra <http://localhost:3000>. Sem `.env.local` o app cai na `DEMO_KEY` da NASA, que é
-limitada a **10 requisições por IP** — a interface avisa quando isso acontece.
-A aba "Explorar acervo" não depende de chave nenhuma.
-
-> Se a aba "Imagem do dia" abrir com o aviso `RATE_LIMIT`, a cota da `DEMO_KEY` deste IP
-> já estourou (ela libera no dia seguinte, não uma hora depois). É exatamente o caso de
-> usar uma chave própria: o cadastro em <https://api.nasa.gov/> é gratuito e instantâneo.
-
-Chave gratuita e instantânea em <https://api.nasa.gov/>.
+Abra <http://localhost:3000>. Não é preciso configurar nada: o APOD agora vem de
+`science.nasa.gov/wp-json/wp/v2/apod-basic`, que não exige `NASA_API_KEY` nem `DEMO_KEY`
+(ver seção "Como funciona"). O arquivo `.env.example` ficou só por compatibilidade, caso
+algum upstream volte a exigir chave no futuro.
 
 ```bash
 npm run build && npm run start   # produção
@@ -33,21 +27,30 @@ npx tsc --noEmit                 # checagem de tipos
 ## Como funciona
 
 ```
-navegador ──▶ /api/apod ──▶ api.nasa.gov/planetary/apod      (com NASA_API_KEY)
-         └─▶ /api/search ──▶ images-api.nasa.gov/search      (sem chave)
+navegador ──▶ /api/apod ──▶ science.nasa.gov/wp-json/wp/v2/apod-basic   (sem chave)
+         └─▶ /api/search ──▶ images-api.nasa.gov/search                 (sem chave)
 ```
 
-- **Chave no servidor.** `src/lib/nasa.ts` lê `process.env.NASA_API_KEY` e monta a URL
-  de upstream; o bundle do cliente só conhece `/api/...`.
+> Até 11/2026 o APOD usava `api.nasa.gov/planetary/apod` (com `NASA_API_KEY`/`DEMO_KEY`).
+> A NASA migrou o APOD para o WordPress de `science.nasa.gov` e, na transição, aquele
+> endpoint antigo ficou quebrado: devolvia `title: "NASA Science"` e uma URL de logo
+> genérica para qualquer data, com ou sem chave própria — não era um problema de
+> configuração do projeto. `src/lib/nasa.ts` foi migrado para a API nova (documentada no
+> "APOD Feed And API User Guide" oficial), que não exige chave nenhuma.
+
+- **Sem chave no servidor.** As duas APIs upstream (APOD e Image Library) são públicas e
+  sem autenticação; o bundle do cliente só conhece `/api/...`.
 - **Cache em duas camadas.** `Map` em memória + JSON em `.nasa-cache/` (gitignored).
-  Entrada do dia: 10 min. Datas antigas: 24 h. Isso é o que torna o DEMO_KEY utilizável.
+  Entrada do dia: 10 min. Datas antigas: 24 h — poupa requisições e deixa a navegação
+  instantânea ao voltar para um dia já visto.
 - **Erros viram contrato.** Toda falha sai como
   `{ ok: false, error: { code, message, retryAfterSeconds } }`, e o cliente traduz para
   português (`RATE_LIMIT`, `DATE_OUT_OF_RANGE`, `QUERY_TOO_SHORT`, `UPSTREAM_ERROR`…).
   Validação local não gasta cota.
-- **Normalização.** `toApodEntry` reduz o payload bruto a um tipo estável, resolve a
-  forma incorporável de vídeo e trata a data em UTC (evita o "dia anterior" em fusos
-  atrás de Greenwich).
+- **Normalização.** `toApodEntry` reduz o payload bruto (que vem em HTML — links,
+  `<strong>`, `&nbsp;`) a um tipo estável em texto puro, resolve a forma incorporável de
+  vídeo (que a API nova só expõe dentro do HTML da página legado) e trata a data em UTC
+  (evita o "dia anterior" em fusos atrás de Greenwich).
 
 ## Rotas
 
@@ -100,25 +103,27 @@ propósito (é `overflow-x: auto`) e os chips de sugestão quebram linha sozinho
 
 Todas confirmadas contra a API real, não supostas:
 
-1. **APOD não tem busca por palavra-chave.** `concept_tags` retorna
-   `"functionality turned off"`. Por isso a busca textual vai para a Image Library,
-   que é chaveless e tem CORS liberado — daí as duas abas.
-2. **`start_date`/`end_date` + `count` retorna 400** (`invalid field combination passed`),
-   em qualquer valor de `count`. Já intervalos longos funcionam: um de 30 dias voltou com
-   os 30 itens, sem truncamento — o teto de 12 itens da doc não se aplica. O app pede a
-   janela que realmente exibe (hoje + 7 dias anteriores) para não gastar cota à toa.
-3. **DEMO_KEY = 10 req por IP, com janela diária.** Confirmado com 429 reais: header
-   `X-Ratelimit-Limit: 10` e `retryAfterSeconds` de ~80 000 s, apontando sempre para a
-   mesma meia-noite UTC — não "por hora" como sugere a página de cadastro. É o motivo do
-   proxy com cache e de recomendar uma chave própria.
-4. **Vídeo do APOD vem de três formas diferentes**, todas vistas na API real: arquivo
-   `.mp4` direto, YouTube já em `/embed/…` e YouTube na forma `/watch…` — esta última
-   recusa `<iframe>` e fica em branco sem tratamento. O normalizador escolhe `<video>`
-   quando há arquivo, converte YouTube/Vimeo para player incorporável
-   (`youtube-nocookie.com/embed/…`, `player.vimeo.com/video/…`) e só então cai em link.
-5. **`thumbnail_url` vem vazio (`""`), não ausente**, em boa parte das entradas — inclusive
-   em vídeos com `thumbs=true`. O normalizador converte `""` em `undefined`, e a tira de
-   miniaturas usa `thumbnailUrl ?? url` e aceita item sem imagem.
+1. **APOD não tem busca por palavra-chave.** Nem a API antiga nem a nova expõem isso
+   (`concept_tags` do upstream antigo retornava `"functionality turned off"`). Por isso a
+   busca textual vai para a Image Library, que é chaveless e tem CORS liberado — daí as
+   duas abas.
+2. **`per_page` do `apod-basic` tem teto de 25** (documentado). O app pede só a janela que
+   realmente exibe (hoje + 7 dias anteriores), bem abaixo do limite.
+3. **Imagem e vídeo vêm em campos diferentes.** Em `media_type: "image"`, a URL real está
+   em `hdurl` (`url` virou o permalink do artigo). Em `media_type: "video"`, não há campo
+   de mídia direto: o player (`<iframe>` do YouTube ou `<video><source>` auto-hospedado)
+   vem embutido dentro de `basic_html`, e `hdurl` é só o pôster/thumbnail. O normalizador
+   (`toApodEntry` + `extractVideoFromHtml` em `src/lib/nasa.ts`) faz essa extração com
+   regex, sem precisar de um parser de HTML completo.
+4. **`explanation` e `credit` chegam em HTML**, não texto puro (links, `<strong>`,
+   entidades como `&nbsp;`/`&#8217;`). O normalizador decodifica entidades e remove tags
+   antes de exibir, e tira o prefixo padrão ("Image Credit & Copyright:") do crédito.
+5. **(Histórico, API antiga)** `api.nasa.gov/planetary/apod` com `DEMO_KEY` limitava a
+   **10 requisições por IP com janela diária** (não "por hora" como sugeria a página de
+   cadastro) — motivo original do cache em disco. Em 11/2026 esse endpoint passou a
+   devolver um placeholder genérico (`title: "NASA Science"`) para qualquer data, com ou
+   sem chave própria, o que forçou a migração para `science.nasa.gov/wp-json/wp/v2/
+   apod-basic` (ver "Como funciona").
 
 ## Estrutura
 
@@ -140,7 +145,7 @@ src/
     CalendarView.tsx      grid mensal para navegar o acervo por mês
     Notice.tsx            avisos de erro/cota
   lib/
-    nasa.ts               chave, cache, fetch de upstream, normalização
+    nasa.ts               cache, fetch de upstream (science.nasa.gov + images-api), normalização
     api.ts                camada de fetch do cliente + mensagens em pt-BR
     dates.ts              aritmética de datas ISO (sem fuso)
     favorites.ts          tipos e helpers de localStorage para favoritos
